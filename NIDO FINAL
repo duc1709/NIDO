@@ -1,0 +1,170 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+const char* ssid     = "sansolfi";
+const char* password = "juanfo57";
+const char* apiKey   = "d762ca7bedb7ea912b92a928f0dc236e";
+
+// Pines
+const int ledPin     = 10;
+const int ldrPin     = A3;
+const int potMoodPin = A4;
+const int potVolPin  = A0;
+const int threshold  = 700;
+
+// DFPlayer
+HardwareSerial dfSerial(1);
+DFRobotDFPlayerMini dfPlayer;
+bool dfReady = false;
+
+// Estados
+bool waiting = false;
+unsigned long waitStart = 0;
+bool playing = false;
+unsigned long playStart = 0;
+const unsigned long playDuration = 5UL * 60UL * 1000UL; // 5 minutos
+
+// Clima
+float latitude = 0, longitude = 0;
+int currentWeather = 1; // 1 = despejado, 2 = nublado, 3 = lluvia
+unsigned long lastWeatherUpdate = 0;
+const unsigned long weatherInterval = 60UL * 60UL * 1000UL; // 1 hora
+
+int readMood() {
+  int v = analogRead(potMoodPin);
+  if (v < 1365) return 1;
+  else if (v < 2730) return 2;
+  else return 3;
+}
+
+const char* moodName(int m) {
+  return m==1 ? "Triste" : (m==2 ? "Neutro" : "Feliz");
+}
+
+const char* weatherName(int w) {
+  return w==1 ? "Despejado" : (w==2 ? "Nublado" : "Lluvia");
+}
+
+int getTrackFromMoodAndWeather(int mood, int weather) {
+  return (weather - 1) * 3 + mood; // 1–9
+}
+
+void getLocation() {
+  HTTPClient http;
+  http.begin("http://ip-api.com/json?fields=lat,lon");
+  if (http.GET() == 200) {
+    StaticJsonDocument<256> doc;
+    deserializeJson(doc, http.getString());
+    latitude  = doc["lat"];
+    longitude = doc["lon"];
+    Serial.printf("Ubicación: %.4f, %.4f\n", latitude, longitude);
+  } else {
+    Serial.printf("Error ubicación: %d\n", http.GET());
+  }
+  http.end();
+}
+
+void updateWeather() {
+  Serial.println("Actualizando clima...");
+  HTTPClient http;
+  String url = String("http://api.openweathermap.org/data/2.5/weather?lat=")
+               + String(latitude,6)
+               + "&lon=" + String(longitude,6)
+               + "&units=metric&appid=" + apiKey;
+  http.begin(url);
+  if (http.GET() == 200) {
+    StaticJsonDocument<512> doc;
+    deserializeJson(doc, http.getString());
+    String w = doc["weather"][0]["main"].as<String>();
+
+    if (w == "Clear") currentWeather = 1;
+    else if (w == "Clouds") currentWeather = 2;
+    else currentWeather = 3;
+
+    Serial.printf("Clima: %s (%s)\n", w.c_str(), weatherName(currentWeather));
+    lastWeatherUpdate = millis();
+  } else {
+    Serial.printf("Error clima: %d\n", http.GET());
+  }
+  http.end();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, HIGH);
+
+  pinMode(ldrPin, INPUT);
+  pinMode(potMoodPin, INPUT);
+  pinMode(potVolPin, INPUT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado");
+
+  getLocation();
+  updateWeather();
+
+  dfSerial.begin(9600, SERIAL_8N1, 2, 1);
+  delay(200);
+  dfReady = dfPlayer.begin(dfSerial);
+  if (dfReady) {
+    dfPlayer.outputDevice(DFPLAYER_DEVICE_SD);
+    dfPlayer.volume(0);
+    Serial.println("DFPlayer listo");
+  } else {
+    Serial.println("Error DFPlayer");
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastWeatherUpdate >= weatherInterval) {
+    updateWeather();
+  }
+
+  int ldrVal = analogRead(ldrPin);
+  if (dfReady) {
+    int vol = map(analogRead(potVolPin), 0, 4095, 0, 30);
+    dfPlayer.volume(vol);
+  }
+
+  if (playing) {
+    if (ldrVal > threshold) {
+      dfPlayer.pause();
+      playing = false;
+      waiting = false;
+    } else if (now - playStart >= playDuration) {
+      dfPlayer.stop();
+      playing = false;
+    }
+  } else {
+    if (ldrVal < threshold) {
+      if (!waiting) {
+        waiting = true;
+        waitStart = now;
+      } else if (now - waitStart >= 5000) {
+        int mood = readMood();
+        int track = getTrackFromMoodAndWeather(mood, currentWeather);
+        Serial.printf("Track %d: Mood %s | Clima %s\n", track, moodName(mood), weatherName(currentWeather));
+        dfPlayer.play(track);
+        playing = true;
+        playStart = now;
+        waiting = false;
+      }
+    } else if (waiting) {
+      waiting = false;
+    }
+  }
+
+  delay(200);
+}
